@@ -10,7 +10,9 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.pipeline import Pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.svm import SVC
 
 
 # ---------------------------------------------------------
@@ -131,227 +133,138 @@ def find_actual_ingredient(korean_name, available_ingredients):
 # ---------------------------------------------------------
 # 4. 여러 모델을 교차 검증하고 최적 모델 학습
 # ---------------------------------------------------------
-@st.cache_resource(show_spinner="화장품 데이터를 불러오고 여러 예측 모델의 성능을 비교하고 있습니다...")
+@st.cache_resource(show_spinner="화장품 데이터를 정리하고 TF-IDF 기반 모델들을 비교하고 있습니다...")
 def load_and_train():
     df = pd.read_csv(DATA_URL, encoding="utf-8")
-
     required_columns = {"ingredients", "category"}
     missing_columns = required_columns - set(df.columns)
     if missing_columns:
-        raise ValueError(
-            "데이터에 필요한 컬럼이 없습니다: " + ", ".join(sorted(missing_columns))
-        )
+        raise ValueError("데이터에 필요한 컬럼이 없습니다: " + ", ".join(sorted(missing_columns)))
 
-    data = df[["ingredients", "category"]].copy()
-    data = data.dropna(subset=["ingredients", "category"])
+    data = df[["ingredients", "category"]].dropna().copy()
     data["category"] = data["category"].astype(str).str.strip()
-    data = data[
-        (data["category"] != "")
-        & (data["category"].str.casefold() != "nan")
-    ].copy()
-
+    data = data[(data["category"] != "") & (data["category"].str.casefold() != "nan")].copy()
     data["ingredient_list"] = data["ingredients"].apply(parse_ingredients)
     data = data[data["ingredient_list"].map(len) > 0].copy()
+    if len(data) < 10 or data["category"].nunique() < 2:
+        raise ValueError("학습에 필요한 제품 데이터 또는 제품 유형이 부족합니다.")
 
-    if len(data) < 10:
-        raise ValueError("학습에 사용할 수 있는 제품 데이터가 10개 미만입니다.")
-    if data["category"].nunique() < 2:
-        raise ValueError("분류할 제품 유형이 2개 미만입니다.")
-
-    X = data["ingredient_list"]
-    y = data["category"]
-
+    # 각 제품의 성분을 공백으로 연결합니다. 성분명 내부 공백은 밑줄로 바꿔
+    # TF-IDF가 하나의 성분 토큰으로 처리하도록 합니다.
+    data["ingredient_text"] = data["ingredient_list"].apply(
+        lambda items: " ".join(item.replace(" ", "_") for item in items)
+    )
+    X, y = data["ingredient_text"], data["category"]
+    counts = y.value_counts()
     test_count = math.ceil(len(data) * 0.2)
     train_count = len(data) - test_count
     class_count = y.nunique()
-    counts = y.value_counts()
-
-    can_stratify = (
-        counts.min() >= 2
-        and test_count >= class_count
-        and train_count >= class_count
-    )
-
+    can_stratify = counts.min() >= 2 and test_count >= class_count and train_count >= class_count
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y if can_stratify else None,
+        X, y, test_size=0.2, random_state=42,
+        stratify=y if can_stratify else None
     )
-
-    # 성분 사전은 학습 데이터에서만 만들고, 테스트 데이터는 변환만 합니다.
-    mlb = MultiLabelBinarizer()
-    X_train_encoded = mlb.fit_transform(X_train)
-    X_test_encoded = mlb.transform(X_test)
-
-    if len(mlb.classes_) == 0:
-        raise ValueError("학습 데이터에서 사용할 수 있는 성분을 찾지 못했습니다.")
     if y_train.nunique() < 2:
         raise ValueError("학습 데이터에 제품 유형이 2개 이상 필요합니다.")
 
-    # 클래스별 데이터가 충분하면 층화 교차 검증을 사용합니다.
-    # 일부 유형의 데이터가 너무 적으면 일반 K-Fold로 비교하고 안내합니다.
-    min_train_class_count = int(y_train.value_counts().min())
-    if min_train_class_count >= 2:
-        n_splits = min(3, min_train_class_count)
+    min_class_count = int(y_train.value_counts().min())
+    if min_class_count >= 2:
+        n_splits = min(3, min_class_count)
         cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_splitter_name = f"층화 {n_splits}-겹 교차 검증"
+        cv_name = f"층화 {n_splits}-겹 교차 검증"
     else:
         n_splits = min(3, len(X_train))
         if n_splits < 2:
             raise ValueError("모델 비교에 필요한 학습 데이터가 부족합니다.")
         cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
-        cv_splitter_name = f"일반 {n_splits}-겹 교차 검증"
+        cv_name = f"일반 {n_splits}-겹 교차 검증"
 
-    model_candidates = {
-        "랜덤 포레스트": RandomForestClassifier(
-            n_estimators=180,
-            random_state=42,
-            class_weight="balanced_subsample",
-            max_features="sqrt",
-            n_jobs=-1,
-        ),
-        "로지스틱 회귀": LogisticRegression(
-            max_iter=3000,
-            class_weight="balanced",
-            C=1.0,
-            solver="lbfgs",
-        ),
-        "나이브 베이즈": MultinomialNB(
-            alpha=0.5,
-            fit_prior=False,
-        ),
+    # 벡터화도 Pipeline 안에서 매 교차검증 fold마다 다시 학습하므로 데이터 누수를 줄입니다.
+    def make_pipeline(classifier):
+        return Pipeline([
+            ("tfidf", TfidfVectorizer(
+                tokenizer=str.split, preprocessor=None, token_pattern=None,
+                lowercase=False, ngram_range=(1, 2), min_df=1,
+                sublinear_tf=True
+            )),
+            ("classifier", classifier),
+        ])
+
+    candidates = {
+        "TF-IDF + 랜덤 포레스트": make_pipeline(RandomForestClassifier(
+            n_estimators=250, random_state=42, class_weight="balanced_subsample",
+            max_features="sqrt", n_jobs=-1
+        )),
+        "TF-IDF + 로지스틱 회귀": make_pipeline(LogisticRegression(
+            max_iter=4000, class_weight="balanced", C=2.0
+        )),
+        "TF-IDF + 나이브 베이즈": make_pipeline(MultinomialNB(alpha=0.3)),
+        "TF-IDF + 선형 SVM": make_pipeline(SVC(
+            kernel="linear", C=1.0, class_weight="balanced", probability=True,
+            random_state=42
+        )),
     }
 
-    # 테스트 데이터는 모델 선택에 사용하지 않습니다.
-    # 학습 데이터 내부의 교차 검증 Macro F1으로 모델을 선택합니다.
-    cv_rows = []
-    fitted_candidates = {}
-    all_train_classes = sorted(y_train.unique().tolist())
-
-    for model_name, estimator in model_candidates.items():
-        fold_f1_scores = []
-        fold_accuracy_scores = []
-        model_failed = False
-
-        for train_indices, valid_indices in cv.split(X_train_encoded, y_train):
+    rows, successful = [], {}
+    all_classes = sorted(y_train.unique().tolist())
+    for name, estimator in candidates.items():
+        scores, accuracies = [], []
+        failed = False
+        for tr_idx, va_idx in cv.split(X_train, y_train):
             fold_model = clone(estimator)
-            X_fold_train = X_train_encoded[train_indices]
-            X_fold_valid = X_train_encoded[valid_indices]
-            y_fold_train = y_train.iloc[train_indices]
-            y_fold_valid = y_train.iloc[valid_indices]
-
             try:
-                fold_model.fit(X_fold_train, y_fold_train)
-                fold_pred = fold_model.predict(X_fold_valid)
-                fold_f1_scores.append(
-                    f1_score(
-                        y_fold_valid,
-                        fold_pred,
-                        labels=all_train_classes,
-                        average="macro",
-                        zero_division=0,
-                    )
-                )
-                fold_accuracy_scores.append(accuracy_score(y_fold_valid, fold_pred))
+                fold_model.fit(X_train.iloc[tr_idx], y_train.iloc[tr_idx])
+                pred = fold_model.predict(X_train.iloc[va_idx])
+                scores.append(f1_score(y_train.iloc[va_idx], pred, labels=all_classes,
+                                       average="macro", zero_division=0))
+                accuracies.append(accuracy_score(y_train.iloc[va_idx], pred))
             except Exception:
-                model_failed = True
+                failed = True
                 break
-
-        if not model_failed and fold_f1_scores:
-            mean_f1 = float(np.mean(fold_f1_scores))
-            mean_accuracy = float(np.mean(fold_accuracy_scores))
-            fitted_candidates[model_name] = estimator
-            cv_rows.append(
-                {
-                    "모델": model_name,
-                    "교차 검증 Macro F1": mean_f1,
-                    "교차 검증 정확도": mean_accuracy,
-                    "비교 결과": "비교 완료",
-                }
-            )
+        if not failed and scores:
+            successful[name] = estimator
+            rows.append({"모델": name, "교차 검증 Macro F1": float(np.mean(scores)),
+                         "교차 검증 정확도": float(np.mean(accuracies)), "비교 결과": "비교 완료"})
         else:
-            cv_rows.append(
-                {
-                    "모델": model_name,
-                    "교차 검증 Macro F1": np.nan,
-                    "교차 검증 정확도": np.nan,
-                    "비교 결과": "데이터 구성상 비교 실패",
-                }
-            )
+            rows.append({"모델": name, "교차 검증 Macro F1": np.nan,
+                         "교차 검증 정확도": np.nan, "비교 결과": "비교 실패"})
+    if not successful:
+        raise ValueError("모든 모델의 교차 검증에 실패했습니다.")
 
-    if not fitted_candidates:
-        raise ValueError("모든 모델의 교차 검증에 실패했습니다. 제품 유형별 데이터 수를 확인해 주세요.")
-
-    cv_results = pd.DataFrame(cv_rows)
-    successful_results = cv_results.dropna(subset=["교차 검증 Macro F1"])
-    best_model_name = successful_results.sort_values(
-        ["교차 검증 Macro F1", "교차 검증 정확도"],
-        ascending=False,
+    cv_results = pd.DataFrame(rows)
+    best_name = cv_results.dropna(subset=["교차 검증 Macro F1"]).sort_values(
+        ["교차 검증 Macro F1", "교차 검증 정확도"], ascending=False
     ).iloc[0]["모델"]
-
-    best_model = clone(fitted_candidates[best_model_name])
-    best_model.fit(X_train_encoded, y_train)
-
-    # 최종 모델을 한 번도 학습에 사용하지 않은 테스트 데이터로 평가합니다.
-    y_pred = best_model.predict(X_test_encoded)
+    best_model = clone(successful[best_name])
+    best_model.fit(X_train, y_train)
+    y_pred = best_model.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
     macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
     weighted_f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-
-    report = classification_report(
-        y_test,
-        y_pred,
-        labels=list(best_model.classes_),
-        output_dict=True,
-        zero_division=0,
-    )
-    report_df = pd.DataFrame(report).transpose()
-
-    # 테스트 데이터에만 등장한 제품 유형은 모델이 학습할 수 없으므로 따로 안내합니다.
-    unseen_test_categories = sorted(set(y_test.unique()) - set(best_model.classes_))
-
-    # 검색 목록은 전체 유효 데이터에서 만들되, 예측 가능 여부는 학습 어휘로 판단합니다.
-    all_ingredients = sorted(
-        {
-            ingredient
-            for items in data["ingredient_list"]
-            for ingredient in items
-        }
-    )
-
-    # 혼동 행렬은 학습된 제품 유형을 기준으로 만듭니다.
+    report_df = pd.DataFrame(classification_report(
+        y_test, y_pred, labels=list(best_model.classes_), output_dict=True,
+        zero_division=0
+    )).transpose()
+    unseen = sorted(set(y_test.unique()) - set(best_model.classes_))
+    all_ingredients = sorted({item for items in data["ingredient_list"] for item in items})
+    trained_ingredients = sorted({
+        item for row_index in X_train.index
+        for item in data.loc[row_index, "ingredient_list"]
+    })
     cm = confusion_matrix(y_test, y_pred, labels=list(best_model.classes_))
-    cm_df = pd.DataFrame(
-        cm,
-        index=[f"실제: {name}" for name in best_model.classes_],
-        columns=[f"예측: {name}" for name in best_model.classes_],
-    )
-
+    cm_df = pd.DataFrame(cm, index=[f"실제: {x}" for x in best_model.classes_],
+                         columns=[f"예측: {x}" for x in best_model.classes_])
     category_counts = data["category"].value_counts().rename_axis("제품 유형").reset_index(name="제품 수")
-
     return {
-        "model": best_model,
-        "best_model_name": best_model_name,
-        "mlb": mlb,
-        "accuracy": accuracy,
-        "macro_f1": macro_f1,
-        "weighted_f1": weighted_f1,
-        "report": report_df,
-        "cv_results": cv_results,
-        "cv_splitter_name": cv_splitter_name,
-        "ingredients": all_ingredients,
-        "classes": list(best_model.classes_),
-        "total_rows": len(data),
-        "train_rows": len(X_train),
-        "test_rows": len(X_test),
-        "category_count": y.nunique(),
-        "unseen_categories": unseen_test_categories,
-        "stratified": can_stratify,
-        "confusion_matrix": cm_df,
-        "category_counts": category_counts,
-        "min_train_class_count": min_train_class_count,
+        "model": best_model, "best_model_name": best_name,
+        "accuracy": accuracy, "macro_f1": macro_f1, "weighted_f1": weighted_f1,
+        "report": report_df, "cv_results": cv_results, "cv_splitter_name": cv_name,
+        "ingredients": all_ingredients, "trained_ingredients": trained_ingredients,
+        "classes": list(best_model.classes_), "total_rows": len(data),
+        "train_rows": len(X_train), "test_rows": len(X_test),
+        "category_count": y.nunique(), "unseen_categories": unseen,
+        "stratified": can_stratify, "confusion_matrix": cm_df,
+        "category_counts": category_counts, "min_train_class_count": min_class_count,
     }
 
 
@@ -364,10 +277,9 @@ except Exception as error:
     st.stop()
 
 model = result["model"]
-mlb = result["mlb"]
 ingredient_list = result["ingredients"]
 all_ingredient_set = set(ingredient_list)
-trained_ingredient_set = set(mlb.classes_)
+trained_ingredient_set = set(result["trained_ingredients"])
 
 # 한국어 별칭은 실제 데이터에 존재하는 성분에 대해서만 연결합니다.
 alias_to_ingredient = {}
@@ -572,11 +484,11 @@ if st.button("🔍 제품 유형 예측하기", type="primary", use_container_wi
         )
     else:
         try:
-            input_encoded = mlb.transform([valid_ingredients])
-            prediction = model.predict(input_encoded)[0]
+            input_text = " ".join(item.replace(" ", "_") for item in valid_ingredients)
+            prediction = model.predict([input_text])[0]
 
             if hasattr(model, "predict_proba"):
-                probabilities = model.predict_proba(input_encoded)[0]
+                probabilities = model.predict_proba([input_text])[0]
                 probability_df = pd.DataFrame(
                     {
                         "제품 유형": model.classes_,
@@ -646,8 +558,8 @@ if "prediction_result" in st.session_state:
 st.divider()
 st.subheader("7. 모델 성능 비교")
 st.write(
-    "랜덤 포레스트, 로지스틱 회귀, 나이브 베이즈를 학습 데이터 내부에서 "
-    "교차 검증한 뒤 Macro F1 점수를 기준으로 최적 모델을 선택했습니다."
+    "TF-IDF로 전성분의 출현 패턴과 상대적 중요도를 반영한 뒤, "
+    "랜덤 포레스트·로지스틱 회귀·나이브 베이즈·선형 SVM을 교차 검증해 비교합니다."
 )
 
 st.success(f"선택된 모델: {result['best_model_name']}")
