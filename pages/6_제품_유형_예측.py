@@ -4,9 +4,12 @@ import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.naive_bayes import MultinomialNB
 from sklearn.preprocessing import MultiLabelBinarizer
 
 
@@ -21,8 +24,9 @@ st.set_page_config(
 
 st.title("🧴 제품 유형 예측")
 st.write(
-    "화장품 전성분을 검색하거나 직접 입력하면 "
-    "랜덤 포레스트 분류 모델이 제품 유형을 예측합니다."
+    "화장품 전성분을 검색하거나 직접 입력하면 제품 유형을 예측합니다. "
+    "여러 분류 모델의 성능을 비교한 뒤, 학습 데이터 검증에서 "
+    "가장 좋은 결과를 보인 모델을 사용합니다."
 )
 
 DATA_URL = (
@@ -34,7 +38,6 @@ DATA_URL = (
 # ---------------------------------------------------------
 # 2. 자주 사용되는 성분 이름과 설명
 # ---------------------------------------------------------
-# 데이터에 실제로 존재하는 영어 성분명과 연결해서 사용합니다.
 INGREDIENT_INFO = {
     "water": {
         "korean": "정제수",
@@ -126,9 +129,9 @@ def find_actual_ingredient(korean_name, available_ingredients):
 
 
 # ---------------------------------------------------------
-# 4. 데이터 불러오기 및 모델 학습
+# 4. 여러 모델을 교차 검증하고 최적 모델 학습
 # ---------------------------------------------------------
-@st.cache_resource(show_spinner="화장품 데이터를 불러오고 예측 모델을 학습하고 있습니다...")
+@st.cache_resource(show_spinner="화장품 데이터를 불러오고 여러 예측 모델의 성능을 비교하고 있습니다...")
 def load_and_train():
     df = pd.read_csv(DATA_URL, encoding="utf-8")
 
@@ -177,7 +180,7 @@ def load_and_train():
         stratify=y if can_stratify else None,
     )
 
-    # 특징 사전은 학습 데이터로만 학습해 데이터 누수를 방지합니다.
+    # 성분 사전은 학습 데이터에서만 만들고, 테스트 데이터는 변환만 합니다.
     mlb = MultiLabelBinarizer()
     X_train_encoded = mlb.fit_transform(X_train)
     X_test_encoded = mlb.transform(X_test)
@@ -187,27 +190,129 @@ def load_and_train():
     if y_train.nunique() < 2:
         raise ValueError("학습 데이터에 제품 유형이 2개 이상 필요합니다.")
 
-    model = RandomForestClassifier(
-        n_estimators=300,
-        random_state=42,
-        class_weight="balanced_subsample",
-        n_jobs=-1,
-    )
-    model.fit(X_train_encoded, y_train)
+    # 클래스별 데이터가 충분하면 층화 교차 검증을 사용합니다.
+    # 일부 유형의 데이터가 너무 적으면 일반 K-Fold로 비교하고 안내합니다.
+    min_train_class_count = int(y_train.value_counts().min())
+    if min_train_class_count >= 2:
+        n_splits = min(3, min_train_class_count)
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_splitter_name = f"층화 {n_splits}-겹 교차 검증"
+    else:
+        n_splits = min(3, len(X_train))
+        if n_splits < 2:
+            raise ValueError("모델 비교에 필요한 학습 데이터가 부족합니다.")
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+        cv_splitter_name = f"일반 {n_splits}-겹 교차 검증"
 
-    y_pred = model.predict(X_test_encoded)
+    model_candidates = {
+        "랜덤 포레스트": RandomForestClassifier(
+            n_estimators=180,
+            random_state=42,
+            class_weight="balanced_subsample",
+            max_features="sqrt",
+            n_jobs=-1,
+        ),
+        "로지스틱 회귀": LogisticRegression(
+            max_iter=3000,
+            class_weight="balanced",
+            C=1.0,
+            solver="lbfgs",
+        ),
+        "나이브 베이즈": MultinomialNB(
+            alpha=0.5,
+            fit_prior=False,
+        ),
+    }
+
+    # 테스트 데이터는 모델 선택에 사용하지 않습니다.
+    # 학습 데이터 내부의 교차 검증 Macro F1으로 모델을 선택합니다.
+    cv_rows = []
+    fitted_candidates = {}
+    all_train_classes = sorted(y_train.unique().tolist())
+
+    for model_name, estimator in model_candidates.items():
+        fold_f1_scores = []
+        fold_accuracy_scores = []
+        model_failed = False
+
+        for train_indices, valid_indices in cv.split(X_train_encoded, y_train):
+            fold_model = clone(estimator)
+            X_fold_train = X_train_encoded[train_indices]
+            X_fold_valid = X_train_encoded[valid_indices]
+            y_fold_train = y_train.iloc[train_indices]
+            y_fold_valid = y_train.iloc[valid_indices]
+
+            try:
+                fold_model.fit(X_fold_train, y_fold_train)
+                fold_pred = fold_model.predict(X_fold_valid)
+                fold_f1_scores.append(
+                    f1_score(
+                        y_fold_valid,
+                        fold_pred,
+                        labels=all_train_classes,
+                        average="macro",
+                        zero_division=0,
+                    )
+                )
+                fold_accuracy_scores.append(accuracy_score(y_fold_valid, fold_pred))
+            except Exception:
+                model_failed = True
+                break
+
+        if not model_failed and fold_f1_scores:
+            mean_f1 = float(np.mean(fold_f1_scores))
+            mean_accuracy = float(np.mean(fold_accuracy_scores))
+            fitted_candidates[model_name] = estimator
+            cv_rows.append(
+                {
+                    "모델": model_name,
+                    "교차 검증 Macro F1": mean_f1,
+                    "교차 검증 정확도": mean_accuracy,
+                    "비교 결과": "비교 완료",
+                }
+            )
+        else:
+            cv_rows.append(
+                {
+                    "모델": model_name,
+                    "교차 검증 Macro F1": np.nan,
+                    "교차 검증 정확도": np.nan,
+                    "비교 결과": "데이터 구성상 비교 실패",
+                }
+            )
+
+    if not fitted_candidates:
+        raise ValueError("모든 모델의 교차 검증에 실패했습니다. 제품 유형별 데이터 수를 확인해 주세요.")
+
+    cv_results = pd.DataFrame(cv_rows)
+    successful_results = cv_results.dropna(subset=["교차 검증 Macro F1"])
+    best_model_name = successful_results.sort_values(
+        ["교차 검증 Macro F1", "교차 검증 정확도"],
+        ascending=False,
+    ).iloc[0]["모델"]
+
+    best_model = clone(fitted_candidates[best_model_name])
+    best_model.fit(X_train_encoded, y_train)
+
+    # 최종 모델을 한 번도 학습에 사용하지 않은 테스트 데이터로 평가합니다.
+    y_pred = best_model.predict(X_test_encoded)
     accuracy = accuracy_score(y_test, y_pred)
+    macro_f1 = f1_score(y_test, y_pred, average="macro", zero_division=0)
+    weighted_f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
+
     report = classification_report(
         y_test,
         y_pred,
-        labels=list(model.classes_),
+        labels=list(best_model.classes_),
         output_dict=True,
         zero_division=0,
     )
     report_df = pd.DataFrame(report).transpose()
 
-    # 검색 목록은 전체 유효 데이터에서 만들고, 실제 예측 가능 여부는
-    # 학습 데이터에서 만들어진 mlb.classes_로 별도 판단합니다.
+    # 테스트 데이터에만 등장한 제품 유형은 모델이 학습할 수 없으므로 따로 안내합니다.
+    unseen_test_categories = sorted(set(y_test.unique()) - set(best_model.classes_))
+
+    # 검색 목록은 전체 유효 데이터에서 만들되, 예측 가능 여부는 학습 어휘로 판단합니다.
     all_ingredients = sorted(
         {
             ingredient
@@ -216,21 +321,37 @@ def load_and_train():
         }
     )
 
-    unseen_test_categories = sorted(set(y_test.unique()) - set(model.classes_))
+    # 혼동 행렬은 학습된 제품 유형을 기준으로 만듭니다.
+    cm = confusion_matrix(y_test, y_pred, labels=list(best_model.classes_))
+    cm_df = pd.DataFrame(
+        cm,
+        index=[f"실제: {name}" for name in best_model.classes_],
+        columns=[f"예측: {name}" for name in best_model.classes_],
+    )
+
+    category_counts = data["category"].value_counts().rename_axis("제품 유형").reset_index(name="제품 수")
 
     return {
-        "model": model,
+        "model": best_model,
+        "best_model_name": best_model_name,
         "mlb": mlb,
         "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
         "report": report_df,
+        "cv_results": cv_results,
+        "cv_splitter_name": cv_splitter_name,
         "ingredients": all_ingredients,
-        "classes": list(model.classes_),
+        "classes": list(best_model.classes_),
         "total_rows": len(data),
         "train_rows": len(X_train),
         "test_rows": len(X_test),
         "category_count": y.nunique(),
         "unseen_categories": unseen_test_categories,
         "stratified": can_stratify,
+        "confusion_matrix": cm_df,
+        "category_counts": category_counts,
+        "min_train_class_count": min_train_class_count,
     }
 
 
@@ -266,8 +387,6 @@ def set_example_selection(example_name):
         actual = find_actual_ingredient(korean_name, all_ingredient_set)
         if actual:
             selected.append(actual)
-
-    # 위젯 key를 직접 수정하는 작업은 콜백 안에서만 수행합니다.
     st.session_state["ingredient_selector"] = list(dict.fromkeys(selected))
 
 
@@ -279,7 +398,6 @@ def choose_conditioning_example():
     set_example_selection("피부 컨디셔닝 성분 예시")
 
 
-# 위젯을 만들기 전에 상태를 초기화합니다.
 if "ingredient_selector" not in st.session_state:
     st.session_state["ingredient_selector"] = []
 
@@ -312,7 +430,6 @@ if search_normalized:
         )
     ]
 else:
-    # 검색어가 없을 때 거대한 전체 목록이 펼쳐지지 않도록 검색을 유도합니다.
     filtered_ingredients = []
 
 if search_normalized and not filtered_ingredients:
@@ -353,7 +470,6 @@ with col2:
 st.divider()
 st.subheader("3. 검색 결과에서 성분 선택")
 
-# 선택된 성분은 검색어가 바뀌어도 선택창에 계속 남도록 옵션에 합칩니다.
 selected_before_widget = st.session_state["ingredient_selector"]
 search_options = filtered_ingredients[:200]
 available_options = sorted(set(search_options) | set(selected_before_widget))
@@ -407,12 +523,8 @@ def convert_user_ingredients(items):
 
 direct_ingredients = convert_user_ingredients(parse_ingredients(direct_input))
 combined_ingredients = list(dict.fromkeys(selected_ingredients + direct_ingredients))
-valid_ingredients = [
-    item for item in combined_ingredients if item in trained_ingredient_set
-]
-excluded_ingredients = [
-    item for item in combined_ingredients if item not in trained_ingredient_set
-]
+valid_ingredients = [item for item in combined_ingredients if item in trained_ingredient_set]
+excluded_ingredients = [item for item in combined_ingredients if item not in trained_ingredient_set]
 
 
 # ---------------------------------------------------------
@@ -433,7 +545,7 @@ if combined_ingredients:
 
     if excluded_ingredients:
         st.warning(
-            "다음 성분은 학습 데이터에 없어서 예측에 반영되지 않습니다: "
+            "다음 성분은 학습 데이터에 없어 예측에 반영되지 않습니다: "
             + ", ".join(excluded_ingredients)
         )
 else:
@@ -447,7 +559,6 @@ st.divider()
 st.subheader("6. 제품 유형 예측")
 
 if st.button("🔍 제품 유형 예측하기", type="primary", use_container_width=True):
-    # 새 예측을 시작하면 이전 결과를 지웁니다.
     st.session_state.pop("prediction_result", None)
     st.session_state.pop("probability_result", None)
     st.session_state.pop("prediction_excluded", None)
@@ -463,14 +574,19 @@ if st.button("🔍 제품 유형 예측하기", type="primary", use_container_wi
         try:
             input_encoded = mlb.transform([valid_ingredients])
             prediction = model.predict(input_encoded)[0]
-            probabilities = model.predict_proba(input_encoded)[0]
 
-            probability_df = pd.DataFrame(
-                {
-                    "제품 유형": model.classes_,
-                    "예측 확률(%)": probabilities * 100,
-                }
-            ).sort_values("예측 확률(%)", ascending=False).reset_index(drop=True)
+            if hasattr(model, "predict_proba"):
+                probabilities = model.predict_proba(input_encoded)[0]
+                probability_df = pd.DataFrame(
+                    {
+                        "제품 유형": model.classes_,
+                        "모델 점수(%)": probabilities * 100,
+                    }
+                ).sort_values("모델 점수(%)", ascending=False).reset_index(drop=True)
+            else:
+                probability_df = pd.DataFrame(
+                    {"제품 유형": [prediction], "모델 점수(%)": [np.nan]}
+                )
 
             st.session_state["prediction_result"] = prediction
             st.session_state["probability_result"] = probability_df
@@ -500,23 +616,22 @@ if "prediction_result" in st.session_state:
         unsafe_allow_html=True,
     )
 
-    st.write("입력한 전성분을 바탕으로 모델이 가장 높은 확률을 부여한 제품 유형입니다.")
-    st.markdown("### 제품 유형별 예측 확률")
+    st.write(f"사용한 모델: **{result['best_model_name']}**")
+    st.write("입력한 전성분을 바탕으로 모델이 가장 높은 점수를 부여한 제품 유형입니다.")
+    st.markdown("### 제품 유형별 모델 점수")
 
-    chart_df = probability_df.head(10).sort_values("예측 확률(%)", ascending=True)
-    st.bar_chart(
-        chart_df.set_index("제품 유형")["예측 확률(%)"],
-        horizontal=True,
-    )
-    st.dataframe(
-        probability_df.style.format({"예측 확률(%)": "{:.2f}%"}),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption(
-        "예측 확률은 모델이 각 유형에 부여한 값이며, "
-        "실제 예측 정확도나 제품이 해당 유형일 확률을 보장하지는 않습니다."
-    )
+    if probability_df["모델 점수(%)"].notna().any():
+        chart_df = probability_df.head(10).sort_values("모델 점수(%)", ascending=True)
+        st.bar_chart(chart_df.set_index("제품 유형")["모델 점수(%)"], horizontal=True)
+        st.dataframe(
+            probability_df.style.format({"모델 점수(%)": "{:.2f}%"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption(
+            "모델 점수는 모델이 계산한 분류 점수이며, 실제 제품이 해당 유형일 확률이나 "
+            "예측 정확도를 보장하지 않습니다."
+        )
 
     if st.session_state.get("prediction_excluded"):
         st.warning(
@@ -526,30 +641,64 @@ if "prediction_result" in st.session_state:
 
 
 # ---------------------------------------------------------
-# 13. 모델 성능 확인
+# 13. 모델 성능 비교 및 평가
 # ---------------------------------------------------------
 st.divider()
-st.subheader("7. 모델 성능 확인")
-st.write("모델이 학습에 사용하지 않은 테스트 데이터로 성능을 확인합니다.")
+st.subheader("7. 모델 성능 비교")
+st.write(
+    "랜덤 포레스트, 로지스틱 회귀, 나이브 베이즈를 학습 데이터 내부에서 "
+    "교차 검증한 뒤 Macro F1 점수를 기준으로 최적 모델을 선택했습니다."
+)
 
+st.success(f"선택된 모델: {result['best_model_name']}")
+st.caption(
+    f"모델 선택 기준: {result['cv_splitter_name']}의 Macro F1 평균 점수. "
+    "테스트 데이터는 모델 선택에 사용하지 않았습니다."
+)
+
+cv_display = result["cv_results"].copy()
+cv_display.columns = ["모델", "교차 검증 Macro F1", "교차 검증 정확도", "비교 결과"]
+st.dataframe(
+    cv_display.style.format(
+        {
+            "교차 검증 Macro F1": "{:.3f}",
+            "교차 검증 정확도": "{:.3f}",
+        },
+        na_rep="-",
+    ),
+    use_container_width=True,
+    hide_index=True,
+)
+st.caption("Macro F1은 데이터가 적은 제품 유형도 큰 제품 유형과 같은 비중으로 평가하는 지표입니다.")
+
+st.markdown("### 선택된 모델의 테스트 데이터 성능")
 metric1, metric2, metric3 = st.columns(3)
 metric1.metric("정확도 (Accuracy)", f"{result['accuracy'] * 100:.2f}%")
-metric2.metric("학습 데이터 수", f"{result['train_rows']:,}개")
-metric3.metric("테스트 데이터 수", f"{result['test_rows']:,}개")
+metric2.metric("Macro F1", f"{result['macro_f1']:.3f}")
+metric3.metric("Weighted F1", f"{result['weighted_f1']:.3f}")
 
-st.write(f"전체 학습 가능 제품 수: **{result['total_rows']:,}개**")
-st.write(f"분류한 제품 유형 수: **{result['category_count']}개**")
+info1, info2, info3 = st.columns(3)
+info1.metric("학습 데이터 수", f"{result['train_rows']:,}개")
+info2.metric("테스트 데이터 수", f"{result['test_rows']:,}개")
+info3.metric("제품 유형 수", f"{result['category_count']}개")
 
 if result["stratified"]:
-    st.caption("제품 유형별 비율을 고려한 층화 분할을 적용했습니다.")
+    st.caption("학습 데이터와 테스트 데이터는 제품 유형별 비율을 고려해 층화 분할했습니다.")
 else:
-    st.caption("일부 제품 유형의 데이터가 적어 일반 무작위 분할을 적용했습니다.")
+    st.caption("일부 제품 유형의 데이터가 적어 학습/테스트 분할은 일반 무작위 분할을 적용했습니다.")
+
+if result["min_train_class_count"] < 2:
+    st.warning(
+        "학습 데이터 중 제품 유형별 제품 수가 1개뿐인 유형이 있습니다. "
+        "이 때문에 층화 교차 검증을 적용하기 어려워 일반 K-Fold로 모델을 비교했습니다. "
+        "해당 유형의 데이터를 추가하면 평가가 더 안정적일 수 있습니다."
+    )
 
 if result["unseen_categories"]:
     st.warning(
         "테스트 데이터에 학습 데이터에서 보지 못한 제품 유형이 포함되어 있습니다. "
-        "이 유형은 학습되지 않았으므로 제품 유형별 성능표에는 표시되지 않지만, "
-        "정확도 계산에서는 오답으로 반영됩니다."
+        "이 유형은 모델이 학습하지 못했으므로 예측할 수 없습니다: "
+        + ", ".join(result["unseen_categories"])
     )
 
 st.markdown("### 제품 유형별 정밀도와 재현율")
@@ -581,8 +730,18 @@ if category_rows:
 else:
     st.info("제품 유형별 성능을 표시할 수 있는 테스트 데이터가 부족합니다.")
 
-with st.expander("정확도, 정밀도, 재현율이란?"):
+with st.expander("혼동 행렬 보기"):
+    st.write("행은 실제 제품 유형, 열은 모델이 예측한 제품 유형입니다.")
+    st.dataframe(result["confusion_matrix"], use_container_width=True)
+
+with st.expander("제품 유형별 데이터 개수 보기"):
+    st.write("제품 유형별 데이터 개수가 크게 다르면 모델이 일부 유형을 더 잘 학습할 수 있습니다.")
+    st.dataframe(result["category_counts"], use_container_width=True, hide_index=True)
+
+with st.expander("평가 지표 설명"):
     st.write("**정확도 (Accuracy)**: 전체 테스트 데이터 중 모델이 정답을 맞힌 비율입니다.")
+    st.write("**Macro F1**: 제품 유형별 F1 점수를 구한 뒤 동일한 비중으로 평균 낸 점수입니다.")
+    st.write("**Weighted F1**: 제품 유형별 F1 점수를 제품 수에 따라 가중 평균한 점수입니다.")
     st.write("**정밀도 (Precision)**: 특정 유형이라고 예측한 제품 중 실제로 그 유형인 비율입니다.")
     st.write("**재현율 (Recall)**: 실제로 특정 유형인 제품 중 모델이 해당 유형이라고 찾아낸 비율입니다.")
     st.write("**F1 점수**: 정밀도와 재현율을 함께 고려한 지표입니다.")
@@ -594,5 +753,6 @@ with st.expander("정확도, 정밀도, 재현율이란?"):
 st.divider()
 st.info(
     "이 프로그램은 화장품 전성분에 포함된 성분을 바탕으로 제품 유형을 분류하는 "
-    "학습용 프로그램입니다. 실제 제품의 용도나 효과를 확정하는 진단 도구는 아닙니다."
+    "학습용 프로그램입니다. 데이터 구성과 제품 유형별 표본 수에 따라 성능이 달라질 수 있으며, "
+    "실제 제품의 용도나 효과를 확정하는 진단 도구는 아닙니다."
 )
